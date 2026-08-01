@@ -593,6 +593,9 @@ struct ContentView: View {
     @State private var newEntryID: UUID? = nil
     @State private var climbRemaining = 0
     @State private var climbStarted = false
+    /// Once true, every leaderboard score is shown; while false, scores hidden
+    /// as "???" per the mystery reveal during the post-game climb.
+    @State private var revealAllScores = false
     @State private var timerBarWidth: CGFloat = 0
     @State private var iconEntryOffset: CGFloat = 0
 
@@ -1031,11 +1034,13 @@ struct ContentView: View {
                 }
                 Spacer()
             } else {
+                let newIndex = entries.firstIndex { $0.id == newEntryID }
                 ScrollView {
                     VStack(spacing: 8) {
                         ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
                             let isNew = entry.id == newEntryID
-                            leaderboardRow(rank: index + 1, entry: entry, isNew: isNew)
+                            let revealed = scoreRevealed(index: index, isNew: isNew, newIndex: newIndex)
+                            leaderboardRow(rank: index + 1, entry: entry, isNew: isNew, revealed: revealed)
                                 .offset(y: isNew ? CGFloat(climbRemaining) * Self.leaderboardRowHeight : 0)
                                 .zIndex(isNew ? 1 : 0)
                         }
@@ -1060,7 +1065,26 @@ struct ContentView: View {
     /// to offset a climbing entry by whole rows as it passes each lower score.
     private static let leaderboardRowHeight: CGFloat = 76
 
-    private func leaderboardRow(rank: Int, entry: ScoreEntry, isNew: Bool = false) -> some View {
+    /// Whether a row's score should be shown (vs. hidden as "???") during the
+    /// mysterious post-game climb. Lower scores reveal one-by-one as the new
+    /// entry climbs past them; higher scores stay hidden until `revealAllScores`
+    /// flips 1s after the climb settles.
+    private func scoreRevealed(index: Int, isNew: Bool, newIndex: Int?) -> Bool {
+        if revealAllScores { return true }
+        // Own score is always visible so the player can watch it climb.
+        if isNew { return true }
+        // Not in a post-game climb for this page → nothing is hidden.
+        guard let newIndex else { return true }
+        if index > newIndex {
+            // A lower score: revealed once the climbing entry has passed it.
+            // The new entry's current visual position is newIndex + climbRemaining.
+            return newIndex + climbRemaining < index
+        }
+        // A higher score: stays "???" until the whole board unlocks.
+        return false
+    }
+
+    private func leaderboardRow(rank: Int, entry: ScoreEntry, isNew: Bool = false, revealed: Bool = true) -> some View {
         HStack(spacing: 14) {
             rankBadge(rank: rank)
             VStack(alignment: .leading, spacing: 2) {
@@ -1072,10 +1096,11 @@ struct ContentView: View {
                     .foregroundColor(Color(red: 0.4, green: 0.4, blue: 0.55))
             }
             Spacer()
-            Text("\(entry.score)")
+            Text(revealed ? "\(entry.score)" : "???")
                 .font(.system(size: 26, weight: .heavy, design: .rounded))
-                .foregroundColor(.orange)
+                .foregroundColor(revealed ? .orange : Color(red: 0.65, green: 0.65, blue: 0.75))
                 .monospacedDigit()
+                .contentTransition(.opacity)
         }
         .padding(.vertical, 12)
         .padding(.horizontal, 16)
@@ -1611,6 +1636,7 @@ struct ContentView: View {
         newEntryID = nil
         climbRemaining = 0
         climbStarted = false
+        revealAllScores = false
         iconEntryOffset = 0
         question = Question.random(mode: newMode, age: age)
         phase = .playing
@@ -1640,6 +1666,7 @@ struct ContentView: View {
         let newID = leaderboard.add(name: trimmed, score: score, mode: mode)
         newEntryID = newID
         climbStarted = false
+        revealAllScores = false
         let ranked = leaderboard.top(for: mode)
         let idx = ranked.firstIndex { $0.id == newID } ?? 0
         climbRemaining = max(0, ranked.count - 1 - idx)   // rows below = rows to climb
@@ -1653,12 +1680,21 @@ struct ContentView: View {
         newEntryID = nil
         climbRemaining = 0
         climbStarted = false
+        revealAllScores = false
         phase = .welcome
     }
 
     /// Climb one row at a time, pausing 100 ms after each lower score is passed.
+    /// Once the climb settles, unlock every hidden score after a 1 s beat.
     private func stepClimb() {
-        guard climbRemaining > 0 else { return }
+        guard climbRemaining > 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                withAnimation(.easeInOut(duration: 0.4)) {
+                    revealAllScores = true
+                }
+            }
+            return
+        }
         withAnimation(.easeInOut(duration: 0.18)) {
             climbRemaining -= 1
         }
