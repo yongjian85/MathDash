@@ -48,6 +48,7 @@ enum GameMode: String, CaseIterable, Identifiable {
     case multiplication
     case division
     case fractions
+    case challenge
     case mix
 
     var id: String { rawValue }
@@ -59,6 +60,7 @@ enum GameMode: String, CaseIterable, Identifiable {
         case .multiplication: return "Times Tables"
         case .division: return "Divide"
         case .fractions: return "Fractions"
+        case .challenge: return "Challenge"
         case .mix: return "Mix It Up"
         }
     }
@@ -79,10 +81,9 @@ enum GameMode: String, CaseIterable, Identifiable {
             let maxDividend = d.divideDivisor.upperBound * d.divideQuotient.upperBound
             return "up to \(maxDividend) ÷ \(d.divideDivisor.lowerBound)–\(d.divideDivisor.upperBound)"
         case .fractions:
-            if age == .g2to3 {
-                return "n⁄d + n⁄d"
-            }
             return "n⁄\(d.fractionDenominator.upperBound) of a whole"
+        case .challenge:
+            return "n⁄d + n⁄d"
         case .mix:
             let names = age.mixOperations.map { $0.shortName }
             switch names.count {
@@ -103,6 +104,7 @@ enum GameMode: String, CaseIterable, Identifiable {
         case .multiplication: return "multiply.circle.fill"
         case .division: return "divide.circle.fill"
         case .fractions: return "chart.pie.fill"
+        case .challenge: return "flame.fill"
         case .mix: return "die.face.5.fill"
         }
     }
@@ -114,6 +116,7 @@ enum GameMode: String, CaseIterable, Identifiable {
         case .multiplication: return Color(red: 0.75, green: 0.4, blue: 0.9)
         case .division: return Color(red: 0.9, green: 0.4, blue: 0.55)
         case .fractions: return Color(red: 0.85, green: 0.6, blue: 0.15)
+        case .challenge: return Color(red: 0.82, green: 0.28, blue: 0.4)
         case .mix: return Color(red: 0.95, green: 0.5, blue: 0.3)
         }
     }
@@ -128,7 +131,8 @@ enum GameMode: String, CaseIterable, Identifiable {
             }
             return .multiplySmall
         case .division: return .divide
-        case .fractions: return age == .g2to3 ? .fractionAdd : .fractionOfWhole
+        case .fractions: return .fractionOfWhole
+        case .challenge: return .fractionAdd
         case .mix: return age.mixOperations.randomElement() ?? .add
         }
     }
@@ -147,7 +151,7 @@ enum AgeGroup: String, CaseIterable, Identifiable {
         case .jkG1: return "JK – Grade 1"
         case .g2to3: return "Grade 2 – 3"
         case .g4to5: return "Grade 4 – 5"
-        case .adult: return "Adult"
+        case .adult: return "Challenge"
         }
     }
 
@@ -182,8 +186,8 @@ enum AgeGroup: String, CaseIterable, Identifiable {
         switch self {
         case .jkG1: return [.addition, .subtraction, .multiplication, .mix]
         case .g2to3: return [.addition, .subtraction, .multiplication, .division, .fractions, .mix]
-        case .g4to5: return [.addition, .subtraction, .multiplication, .division, .fractions, .mix]
-        case .adult: return [.addition, .subtraction, .multiplication, .division, .mix]
+        case .g4to5: return [.addition, .subtraction, .multiplication, .division, .mix]
+        case .adult: return [.addition, .subtraction, .multiplication, .division, .challenge, .mix]
         }
     }
 
@@ -199,7 +203,9 @@ enum AgeGroup: String, CaseIterable, Identifiable {
                     ops.append(.multiplyBig)
                 }
             case .division: ops.append(.divide)
-            case .fractions: ops.append(self == .g2to3 ? .fractionAdd : .fractionOfWhole)
+            case .fractions: ops.append(.fractionOfWhole)
+            // Challenge (fraction addition) stays out of Mix — it's its own mode.
+            case .challenge: break
             case .mix: break
             }
         }
@@ -558,9 +564,11 @@ struct ContentView: View {
 
     private static let playerNameKey = "mathdash.playerName"
     private static let ageGroupKey = "mathdash.ageGroup"
+    private static let focusModeKey = "mathdash.focusMode"
 
     @StateObject private var leaderboard = Leaderboard()
     @State private var phase: GamePhase = .welcome
+    @State private var focusMode: Bool = UserDefaults.standard.bool(forKey: ContentView.focusModeKey)
     @State private var mode: GameMode = .addition
     @State private var age: AgeGroup = {
         let raw = UserDefaults.standard.string(forKey: ContentView.ageGroupKey) ?? ""
@@ -602,14 +610,27 @@ struct ContentView: View {
 
     private var isOnFire: Bool { streak >= 3 }
 
-    var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.55, green: 0.85, blue: 1.0), Color(red: 0.85, green: 0.75, blue: 1.0)],
+    /// Fun mode gets the bright playful gradient; Focus mode gets a calm slate
+    /// backdrop so nothing competes with the math.
+    private var backgroundGradient: LinearGradient {
+        if focusMode {
+            return LinearGradient(
+                colors: [Color(red: 0.44, green: 0.49, blue: 0.58), Color(red: 0.56, green: 0.60, blue: 0.68)],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
-            .ignoresSafeArea()
+        }
+        return LinearGradient(
+            colors: [Color(red: 0.55, green: 0.85, blue: 1.0), Color(red: 0.85, green: 0.75, blue: 1.0)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    var body: some View {
+        ZStack {
+            backgroundGradient
+                .ignoresSafeArea()
 
             switch phase {
             case .welcome: welcomeView
@@ -638,6 +659,8 @@ struct ContentView: View {
                     .foregroundColor(.white.opacity(0.9))
             }
             .padding(.top, 20)
+
+            modeToggle
 
             VStack(spacing: 14) {
                 ForEach(AgeGroup.allCases) { g in
@@ -669,6 +692,39 @@ struct ContentView: View {
             Spacer()
         }
         .padding(24)
+    }
+
+    // Fun vs Focus experience picker. Focus strips every non-essential visual
+    // (vehicle, flames, popups, sound, bright colors) so play stays distraction-free.
+    private var modeToggle: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 0) {
+                ForEach([false, true], id: \.self) { focus in
+                    let isSelected = focusMode == focus
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.25)) { setFocusMode(focus) }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: focus ? "leaf.fill" : "sparkles")
+                            Text(focus ? "Focus" : "Fun")
+                        }
+                        .font(.system(size: 17, weight: .heavy, design: .rounded))
+                        .foregroundColor(isSelected ? Color(red: 0.2, green: 0.2, blue: 0.4) : .white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(
+                            Capsule().fill(isSelected ? Color.white : Color.clear)
+                        )
+                    }
+                }
+            }
+            .padding(4)
+            .background(Capsule().fill(Color.white.opacity(0.25)))
+
+            Text(focusMode ? "No distractions — just the math." : "Vehicles, streaks & flair.")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundColor(.white.opacity(0.85))
+        }
     }
 
     private func ageCard(_ g: AgeGroup) -> some View {
@@ -1127,8 +1183,8 @@ struct ContentView: View {
             scoreChip(
                 label: "Streak",
                 value: streak,
-                color: isOnFire ? Color(red: 0.95, green: 0.35, blue: 0.15) : .pink,
-                showFlame: isOnFire
+                color: (!focusMode && isOnFire) ? Color(red: 0.95, green: 0.35, blue: 0.15) : .pink,
+                showFlame: !focusMode && isOnFire
             )
         }
     }
@@ -1196,20 +1252,25 @@ struct ContentView: View {
                     .shadow(color: .black.opacity(0.4), radius: 1)
                     .frame(maxWidth: .infinity)
                     .frame(height: 28)
-                Text(vehicleIcon)
-                    .font(.system(size: 66))
-                    // vehicleX tracks the current-time tip (sub-pixel per tick, so no
-                    // smoothing modifier needed); iconEntryOffset is the entry slide.
-                    .frame(width: vehicleSize, height: vehicleSize)
-                    // Swap the emoji instantly — only the slide (below) animates.
-                    .animation(nil, value: vehicleIcon)
-                    .offset(x: vehicleX + iconEntryOffset, y: -8)
+                if !focusMode {
+                    Text(vehicleIcon)
+                        .font(.system(size: 66))
+                        // vehicleX tracks the current-time tip (sub-pixel per tick, so no
+                        // smoothing modifier needed); iconEntryOffset is the entry slide.
+                        .frame(width: vehicleSize, height: vehicleSize)
+                        // Swap the emoji instantly — only the slide (below) animates.
+                        .animation(nil, value: vehicleIcon)
+                        .offset(x: vehicleX + iconEntryOffset, y: -8)
+                }
             }
             .onAppear { timerBarWidth = geo.size.width }
             .onChange(of: geo.size.width) { _ in timerBarWidth = geo.size.width }
-            .onChange(of: vehicleIcon) { _ in slideIconIn(vehicleSize: vehicleSize) }
+            .onChange(of: vehicleIcon) { _ in
+                guard !focusMode else { return }
+                slideIconIn(vehicleSize: vehicleSize)
+            }
         }
-        .frame(height: 78)
+        .frame(height: focusMode ? 28 : 78)
     }
 
     /// Snap the icon to the right end of the bar, then slide it to the current
@@ -1367,7 +1428,7 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.2), value: currentPoints)
             .animation(.easeInOut(duration: 0.2), value: questionSecondsLeft)
 
-            if let pointsPopup {
+            if !focusMode, let pointsPopup {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(pointsPopup >= 0 ? "+\(pointsPopup)" : "\(pointsPopup)")
                         .font(.system(size: 40, weight: .heavy, design: .rounded))
@@ -1607,7 +1668,13 @@ struct ContentView: View {
     }
 
     private func playCorrectFeedback() {
+        guard !focusMode else { return }
         AudioServicesPlaySystemSound(1057)
+    }
+
+    private func setFocusMode(_ on: Bool) {
+        focusMode = on
+        UserDefaults.standard.set(on, forKey: Self.focusModeKey)
     }
 }
 
