@@ -308,6 +308,28 @@ struct ScoreEntry: Codable, Identifiable {
     let score: Int
     let mode: String
     let date: Date
+    let focusMode: Bool
+
+    init(id: UUID, name: String, score: Int, mode: String, date: Date, focusMode: Bool) {
+        self.id = id
+        self.name = name
+        self.score = score
+        self.mode = mode
+        self.date = date
+        self.focusMode = focusMode
+    }
+
+    // Custom decode so scores saved before `focusMode` existed still load
+    // (missing key defaults to Fun mode).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        score = try c.decode(Int.self, forKey: .score)
+        mode = try c.decode(String.self, forKey: .mode)
+        date = try c.decode(Date.self, forKey: .date)
+        focusMode = try c.decodeIfPresent(Bool.self, forKey: .focusMode) ?? false
+    }
 }
 
 final class Leaderboard: ObservableObject {
@@ -334,14 +356,15 @@ final class Leaderboard: ObservableObject {
     }
 
     @discardableResult
-    func add(name: String, score: Int, mode: GameMode) -> UUID {
+    func add(name: String, score: Int, mode: GameMode, focusMode: Bool) -> UUID {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         let entry = ScoreEntry(
             id: UUID(),
             name: trimmed.isEmpty ? "Player" : trimmed,
             score: score,
             mode: mode.rawValue,
-            date: Date()
+            date: Date(),
+            focusMode: focusMode
         )
         entries.append(entry)
         trimToTop()
@@ -408,7 +431,7 @@ struct Question {
     var fractionOperands: [Fraction]? = nil
     var fractionOptions: [Fraction]? = nil
 
-    static func random(mode: GameMode, age: AgeGroup) -> Question {
+    static func random(mode: GameMode, age: AgeGroup, focusMode: Bool = false) -> Question {
         let op = mode.nextOperation(for: age)
         let d = age.difficulty
         let left: Int
@@ -461,6 +484,33 @@ struct Question {
         }
 
         var options: Set<Int> = [answer]
+
+        // Focus mode, Grade 4–5 and Challenge: when the correct answer is two
+        // digits, every wrong option is one step away — ±1 on the ones digit (±1)
+        // or the tens digit (±10). Filling to 4 skips the generic logic below.
+        if focusMode && (age == .g4to5 || age == .adult) && (10...99).contains(answer) {
+            let neighbors = [answer - 10, answer - 1, answer + 1, answer + 10]
+                .filter { $0 > 0 && $0 != answer }
+                .shuffled()
+            for candidate in neighbors where options.count < 4 {
+                options.insert(candidate)
+            }
+        }
+
+        // Focus mode, Grade 4–5 and Challenge: when the correct answer is three
+        // digits, every wrong option is ±1 or ±2 on the ones (±1/±2), tens
+        // (±10/±20) or hundreds (±100/±200) digit.
+        if focusMode && (age == .g4to5 || age == .adult) && (100...999).contains(answer) {
+            let deltas = [-200, -100, -20, -10, -2, -1, 1, 2, 10, 20, 100, 200]
+            let neighbors = deltas
+                .map { answer + $0 }
+                .filter { $0 > 0 && $0 != answer }
+                .shuffled()
+            for candidate in neighbors where options.count < 4 {
+                options.insert(candidate)
+            }
+        }
+
         var matchingCount = 0
         let targetMatching = Int.random(in: 1...3)
 
@@ -586,6 +636,9 @@ struct ContentView: View {
     @State private var selected: Int? = nil
     @State private var timeRemaining: Double = ContentView.gameDuration
     @State private var questionElapsed: Double = 0
+    /// Time spent on each question (Focus-mode end-of-game stats). A timed-out
+    /// question records the full time limit.
+    @State private var answerTimes: [Double] = []
     @State private var pointsPopup: Int? = nil
     @State private var bonusPopup: Int? = nil
     @State private var didTimeOut = false
@@ -887,6 +940,10 @@ struct ContentView: View {
                     .shadow(color: .black.opacity(0.15), radius: 10, y: 6)
             )
 
+            if focusMode, !answerTimes.isEmpty {
+                timingStatsCard
+            }
+
             if showNameEntry {
                 nameEntryCard
             }
@@ -939,6 +996,30 @@ struct ContentView: View {
             }
         }
         .padding(24)
+    }
+
+    /// Focus-mode timing breakdown for the finished game.
+    private var timingStatsCard: some View {
+        let fastest = answerTimes.min() ?? 0
+        let slowest = answerTimes.max() ?? 0
+        let average = answerTimes.reduce(0, +) / Double(answerTimes.count)
+        func fmt(_ t: Double) -> String { String(format: "%.1fs", t) }
+
+        return VStack(spacing: 16) {
+            resultRow(label: "Fastest Answer", value: fmt(fastest),
+                      color: Color(red: 0.3, green: 0.7, blue: 0.5))
+            resultRow(label: "Slowest Answer", value: fmt(slowest),
+                      color: Color(red: 0.85, green: 0.5, blue: 0.2))
+            resultRow(label: "Average Time", value: fmt(average),
+                      color: Color(red: 0.4, green: 0.5, blue: 0.9))
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 28)
+                .fill(Color.white)
+                .shadow(color: .black.opacity(0.15), radius: 10, y: 6)
+        )
     }
 
     private var nameEntryCard: some View {
@@ -1091,9 +1172,12 @@ struct ContentView: View {
                 Text(entry.name)
                     .font(.system(size: 18, weight: .heavy, design: .rounded))
                     .foregroundColor(Color(red: 0.2, green: 0.2, blue: 0.4))
-                Text(entry.date, style: .date)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundColor(Color(red: 0.4, green: 0.4, blue: 0.55))
+                HStack(spacing: 6) {
+                    modeBadge(focus: entry.focusMode)
+                    Text(entry.date, style: .date)
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundColor(Color(red: 0.4, green: 0.4, blue: 0.55))
+                }
             }
             Spacer()
             Text(revealed ? "\(entry.score)" : "???")
@@ -1113,6 +1197,24 @@ struct ContentView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 18)
                 .stroke(Color.orange, lineWidth: isNew ? 3 : 0)
+        )
+    }
+
+    /// Small pill marking whether a score was earned in Focus or Fun mode.
+    private func modeBadge(focus: Bool) -> some View {
+        let tint = focus ? Color(red: 0.3, green: 0.55, blue: 0.45)
+                         : Color(red: 0.85, green: 0.5, blue: 0.2)
+        return HStack(spacing: 3) {
+            Image(systemName: focus ? "leaf.fill" : "sparkles")
+                .font(.system(size: 9, weight: .bold))
+            Text(focus ? "Focus" : "Fun")
+                .font(.system(size: 10, weight: .heavy, design: .rounded))
+        }
+        .foregroundColor(tint)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(
+            Capsule().fill(tint.opacity(0.15))
         )
     }
 
@@ -1559,6 +1661,9 @@ struct ContentView: View {
 
     private func handleTimeout() {
         didTimeOut = true
+        // No answer given — count the full time limit as this question's time,
+        // so a timeout registers as the slowest answer.
+        answerTimes.append(age.questionTimeLimit)
         let penalty = -Self.wrongPenalty
         score = max(0, score + penalty)
         withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
@@ -1574,7 +1679,7 @@ struct ContentView: View {
     private func advanceAfterDelay() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
             guard phase == .playing else { return }
-            question = Question.random(mode: mode, age: age)
+            question = Question.random(mode: mode, age: age, focusMode: focusMode)
             selected = nil
             didTimeOut = false
             questionElapsed = 0
@@ -1588,6 +1693,7 @@ struct ContentView: View {
     private func tap(_ choice: Int) {
         guard phase == .playing, !isAnswered else { return }
         selected = choice
+        answerTimes.append(questionElapsed)
 
         let base: Int
         var bonus = 0
@@ -1629,6 +1735,7 @@ struct ContentView: View {
         didTimeOut = false
         timeRemaining = Self.gameDuration
         questionElapsed = 0
+        answerTimes = []
         pointsPopup = nil
         bonusPopup = nil
         hasSubmittedScore = false
@@ -1638,7 +1745,7 @@ struct ContentView: View {
         climbStarted = false
         revealAllScores = false
         iconEntryOffset = 0
-        question = Question.random(mode: newMode, age: age)
+        question = Question.random(mode: newMode, age: age, focusMode: focusMode)
         phase = .playing
     }
 
@@ -1663,7 +1770,7 @@ struct ContentView: View {
             return
         }
         UserDefaults.standard.set(trimmed, forKey: Self.playerNameKey)
-        let newID = leaderboard.add(name: trimmed, score: score, mode: mode)
+        let newID = leaderboard.add(name: trimmed, score: score, mode: mode, focusMode: focusMode)
         newEntryID = newID
         climbStarted = false
         revealAllScores = false
