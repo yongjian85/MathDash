@@ -16,6 +16,7 @@ enum Operation {
     case multiplyBig
     case divide
     case fractionOfWhole
+    case fractionAdd
 
     var symbol: String {
         switch self {
@@ -24,6 +25,7 @@ enum Operation {
         case .multiplySmall, .multiplyBig: return "×"
         case .divide: return "÷"
         case .fractionOfWhole: return "of"
+        case .fractionAdd: return "+"
         }
     }
 
@@ -35,6 +37,7 @@ enum Operation {
         case .multiplyBig: return "big ×"
         case .divide: return "divide"
         case .fractionOfWhole: return "fractions"
+        case .fractionAdd: return "fractions"
         }
     }
 }
@@ -76,6 +79,9 @@ enum GameMode: String, CaseIterable, Identifiable {
             let maxDividend = d.divideDivisor.upperBound * d.divideQuotient.upperBound
             return "up to \(maxDividend) ÷ \(d.divideDivisor.lowerBound)–\(d.divideDivisor.upperBound)"
         case .fractions:
+            if age == .g2to3 {
+                return "n⁄d + n⁄d"
+            }
             return "n⁄\(d.fractionDenominator.upperBound) of a whole"
         case .mix:
             let names = age.mixOperations.map { $0.shortName }
@@ -122,7 +128,7 @@ enum GameMode: String, CaseIterable, Identifiable {
             }
             return .multiplySmall
         case .division: return .divide
-        case .fractions: return .fractionOfWhole
+        case .fractions: return age == .g2to3 ? .fractionAdd : .fractionOfWhole
         case .mix: return age.mixOperations.randomElement() ?? .add
         }
     }
@@ -175,7 +181,7 @@ enum AgeGroup: String, CaseIterable, Identifiable {
     var availableModes: [GameMode] {
         switch self {
         case .jkG1: return [.addition, .subtraction, .multiplication, .mix]
-        case .g2to3: return [.addition, .subtraction, .multiplication, .division, .mix]
+        case .g2to3: return [.addition, .subtraction, .multiplication, .division, .fractions, .mix]
         case .g4to5: return [.addition, .subtraction, .multiplication, .division, .fractions, .mix]
         case .adult: return [.addition, .subtraction, .multiplication, .division, .mix]
         }
@@ -193,7 +199,7 @@ enum AgeGroup: String, CaseIterable, Identifiable {
                     ops.append(.multiplyBig)
                 }
             case .division: ops.append(.divide)
-            case .fractions: ops.append(.fractionOfWhole)
+            case .fractions: ops.append(self == .g2to3 ? .fractionAdd : .fractionOfWhole)
             case .mix: break
             }
         }
@@ -235,7 +241,7 @@ enum AgeGroup: String, CaseIterable, Identifiable {
                 subtractLeft: 10...99, subtractRight: 1...99, subtractDelta: -15...15,
                 smallMultLeft: 2...9, smallMultRight: 2...9, smallMultDelta: -10...10,
                 bigMultLeft: 10...99, bigMultRight: 2...9, bigMultDelta: -40...40,
-                divideDivisor: 2...9, divideQuotient: 2...9, divideDelta: -8...8,
+                divideDivisor: 2...9, divideQuotient: 2...16, divideDelta: -8...8,
                 fractionDenominator: 2...9, fractionMultiplier: 2...8, fractionDelta: -8...8
             )
         case .adult:
@@ -276,6 +282,20 @@ enum GamePhase {
     case welcome, selectMode, playing, gameOver, leaderboard
 }
 
+extension View {
+    /// Swipeable, dot-paged style for the leaderboard (iOS-only page style).
+    @ViewBuilder
+    func pagedLeaderboardStyle() -> some View {
+        #if os(iOS)
+        self
+            .tabViewStyle(.page(indexDisplayMode: .always))
+            .indexViewStyle(.page(backgroundDisplayMode: .always))
+        #else
+        self
+        #endif
+    }
+}
+
 struct ScoreEntry: Codable, Identifiable {
     let id: UUID
     let name: String
@@ -307,7 +327,8 @@ final class Leaderboard: ObservableObject {
         return score > (modeEntries.last?.score ?? 0)
     }
 
-    func add(name: String, score: Int, mode: GameMode) {
+    @discardableResult
+    func add(name: String, score: Int, mode: GameMode) -> UUID {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         let entry = ScoreEntry(
             id: UUID(),
@@ -319,6 +340,7 @@ final class Leaderboard: ObservableObject {
         entries.append(entry)
         trimToTop()
         save()
+        return entry.id
     }
 
     private func trimToTop() {
@@ -348,6 +370,28 @@ final class Leaderboard: ObservableObject {
     }
 }
 
+struct Fraction: Equatable {
+    let num: Int
+    let den: Int
+
+    init(_ num: Int, _ den: Int) {
+        let g = max(1, Fraction.gcd(abs(num), abs(den)))
+        let sign = den < 0 ? -1 : 1
+        self.num = sign * num / g
+        self.den = abs(den) / g
+    }
+
+    static func gcd(_ a: Int, _ b: Int) -> Int {
+        var a = a, b = b
+        while b != 0 { (a, b) = (b, a % b) }
+        return max(a, 1)
+    }
+
+    static func + (lhs: Fraction, rhs: Fraction) -> Fraction {
+        Fraction(lhs.num * rhs.den + rhs.num * lhs.den, lhs.den * rhs.den)
+    }
+}
+
 struct Question {
     let left: Int
     let right: Int
@@ -355,6 +399,8 @@ struct Question {
     let whole: Int?
     let choices: [Int]
     let answer: Int
+    var fractionOperands: [Fraction]? = nil
+    var fractionOptions: [Fraction]? = nil
 
     static func random(mode: GameMode, age: AgeGroup) -> Question {
         let op = mode.nextOperation(for: age)
@@ -404,6 +450,8 @@ struct Question {
             whole = denominator * multiplier
             answer = numerator * multiplier
             deltaRange = d.fractionDelta
+        case .fractionAdd:
+            return fractionAddQuestion()
         }
 
         var options: Set<Int> = [answer]
@@ -446,6 +494,57 @@ struct Question {
             answer: answer
         )
     }
+
+    // Fraction + fraction (numerator 1–9, denominator 2–9). Choices are indices
+    // into `fractionOptions`, so the Int-based answer/scoring pipeline is reused.
+    static func fractionAddQuestion() -> Question {
+        // Keep both addends and the sum as true fractions — no whole numbers.
+        var f1 = Fraction(Int.random(in: 1...9), Int.random(in: 2...9))
+        var f2 = Fraction(Int.random(in: 1...9), Int.random(in: 2...9))
+        while f1.den == 1 || f2.den == 1 || (f1 + f2).den == 1 {
+            f1 = Fraction(Int.random(in: 1...9), Int.random(in: 2...9))
+            f2 = Fraction(Int.random(in: 1...9), Int.random(in: 2...9))
+        }
+        let answer = f1 + f2
+
+        var options: [Fraction] = [answer]
+        func tryAdd(_ f: Fraction) {
+            if f.num > 0 && f.den > 1 && !options.contains(f) {
+                options.append(f)
+            }
+        }
+
+        // Classic mistake: add tops and bottoms.
+        tryAdd(Fraction(f1.num + f2.num, f1.den + f2.den))
+        // Near misses on the reduced answer.
+        tryAdd(Fraction(answer.num + 1, answer.den))
+        tryAdd(Fraction(max(1, answer.num - 1), answer.den))
+        tryAdd(Fraction(answer.num, answer.den + 1))
+
+        var attempts = 0
+        while options.count < 4 && attempts < 60 {
+            attempts += 1
+            tryAdd(Fraction(Int.random(in: 1...9), Int.random(in: 2...9)))
+        }
+        var extra = 2
+        while options.count < 4 {
+            tryAdd(Fraction(answer.num + extra, answer.den))
+            extra += 1
+        }
+
+        let shuffled = Array(options.prefix(4)).shuffled()
+        let answerIndex = shuffled.firstIndex(of: answer) ?? 0
+        return Question(
+            left: f1.num,
+            right: f2.num,
+            operation: .fractionAdd,
+            whole: nil,
+            choices: Array(0..<shuffled.count),
+            answer: answerIndex,
+            fractionOperands: [f1, f2],
+            fractionOptions: shuffled
+        )
+    }
 }
 
 struct ContentView: View {
@@ -475,6 +574,7 @@ struct ContentView: View {
     @State private var score = 0
     @State private var streak = 0
     @State private var bestStreak = 0
+    @State private var correctCount = 0
     @State private var selected: Int? = nil
     @State private var timeRemaining: Double = ContentView.gameDuration
     @State private var questionElapsed: Double = 0
@@ -482,6 +582,11 @@ struct ContentView: View {
     @State private var bonusPopup: Int? = nil
     @State private var didTimeOut = false
     @State private var showQuitConfirmation = false
+    @State private var newEntryID: UUID? = nil
+    @State private var climbRemaining = 0
+    @State private var climbStarted = false
+    @State private var timerBarWidth: CGFloat = 0
+    @State private var iconEntryOffset: CGFloat = 0
 
     private var isAnswered: Bool { selected != nil || didTimeOut }
     private var timeFraction: Double { timeRemaining / Self.gameDuration }
@@ -680,6 +785,7 @@ struct ContentView: View {
             header
 
             timerBar
+                .padding(.horizontal, -12)
 
             Spacer()
 
@@ -832,76 +938,73 @@ struct ContentView: View {
                 Color.clear.frame(width: 40, height: 40)
             }
 
-            VStack(spacing: 10) {
+            TabView(selection: $leaderboardMode) {
                 ForEach(GameMode.allCases) { mode in
-                    leaderboardSection(mode: mode)
+                    leaderboardPage(mode: mode)
+                        .tag(mode)
                 }
             }
-            .frame(maxHeight: .infinity, alignment: .top)
+            .pagedLeaderboardStyle()
+            .frame(maxHeight: .infinity)
         }
         .padding(24)
     }
 
     @ViewBuilder
-    private func leaderboardSection(mode: GameMode) -> some View {
-        let isExpanded = mode == leaderboardMode
-        Button {
-            withAnimation(.spring(response: 0.4, dampingFraction: 0.78)) {
-                leaderboardMode = mode
+    private func leaderboardPage(mode: GameMode) -> some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: mode.icon)
+                    .font(.system(size: 22, weight: .heavy))
+                Text(mode.title)
+                    .font(.system(size: 22, weight: .heavy, design: .rounded))
             }
-        } label: {
-            VStack(spacing: 10) {
-                HStack(spacing: 12) {
-                    Image(systemName: mode.icon)
-                        .font(.system(size: 20, weight: .heavy))
-                        .foregroundColor(.white)
-                    Text(mode.title)
-                        .font(.system(size: 18, weight: .heavy, design: .rounded))
-                        .foregroundColor(.white)
-                    Spacer()
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 14, weight: .heavy))
-                        .foregroundColor(.white.opacity(0.85))
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 14)
+            .foregroundColor(.white)
+            .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
 
-                if isExpanded {
-                    let entries = leaderboard.top(for: mode)
-                    if entries.isEmpty {
-                        VStack(spacing: 8) {
-                            Image(systemName: "trophy")
-                                .font(.system(size: 32, weight: .heavy))
-                                .foregroundColor(.white.opacity(0.8))
-                            Text("No scores yet")
-                                .font(.system(size: 15, weight: .semibold, design: .rounded))
-                                .foregroundColor(.white)
+            let entries = leaderboard.top(for: mode)
+            if entries.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: "trophy")
+                        .font(.system(size: 40, weight: .heavy))
+                        .foregroundColor(.white.opacity(0.8))
+                    Text("No scores yet")
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .foregroundColor(.white)
+                }
+                Spacer()
+            } else {
+                ScrollView {
+                    VStack(spacing: 8) {
+                        ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                            let isNew = entry.id == newEntryID
+                            leaderboardRow(rank: index + 1, entry: entry, isNew: isNew)
+                                .offset(y: isNew ? CGFloat(climbRemaining) * Self.leaderboardRowHeight : 0)
+                                .zIndex(isNew ? 1 : 0)
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.bottom, 16)
-                    } else {
-                        ScrollView {
-                            VStack(spacing: 8) {
-                                ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
-                                    leaderboardRow(rank: index + 1, entry: entry)
-                                }
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.bottom, 12)
-                        }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.bottom, 12)
+                }
+                .onAppear {
+                    guard entries.contains(where: { $0.id == newEntryID }), !climbStarted else { return }
+                    climbStarted = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        stepClimb()
                     }
                 }
             }
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: 22)
-                    .fill(Color.white.opacity(isExpanded ? 0.2 : 0.1))
-            )
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(.bottom, 30)
     }
 
-    private func leaderboardRow(rank: Int, entry: ScoreEntry) -> some View {
+    /// Approximate on-screen height of one leaderboard row (incl. spacing), used
+    /// to offset a climbing entry by whole rows as it passes each lower score.
+    private static let leaderboardRowHeight: CGFloat = 76
+
+    private func leaderboardRow(rank: Int, entry: ScoreEntry, isNew: Bool = false) -> some View {
         HStack(spacing: 14) {
             rankBadge(rank: rank)
             VStack(alignment: .leading, spacing: 2) {
@@ -923,7 +1026,12 @@ struct ContentView: View {
         .background(
             RoundedRectangle(cornerRadius: 18)
                 .fill(Color.white)
-                .shadow(color: .black.opacity(0.1), radius: 4, y: 2)
+                .shadow(color: isNew ? .orange.opacity(0.5) : .black.opacity(0.1),
+                        radius: isNew ? 8 : 4, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(Color.orange, lineWidth: isNew ? 3 : 0)
         )
     }
 
@@ -1061,24 +1169,69 @@ struct ContentView: View {
         .animation(.spring(response: 0.35, dampingFraction: 0.7), value: showFlame)
     }
 
+    // Vehicle progression: upgrades one stage per 3 correct answers.
+    private static let vehicleStages = ["👶", "🚲", "🏍️", "🚐", "🏎️", "🚄", "🛩️", "✈️", "🚀"]
+
+    private var vehicleIcon: String {
+        let stage = min(correctCount / 3, Self.vehicleStages.count - 1)
+        return Self.vehicleStages[stage]
+    }
+
     private var timerBar: some View {
         GeometryReader { geo in
-            ZStack(alignment: .leading) {
+            let fillWidth = max(0, geo.size.width * timeFraction)
+            let vehicleSize: CGFloat = 90
+            let vehicleX = min(max(fillWidth - vehicleSize / 2, 0), geo.size.width - vehicleSize)
+            ZStack(alignment: .bottomLeading) {
                 RoundedRectangle(cornerRadius: 12)
                     .fill(Color.white.opacity(0.35))
+                    .frame(height: 28)
                 RoundedRectangle(cornerRadius: 12)
                     .fill(timerColor)
-                    .frame(width: max(0, geo.size.width * timeFraction))
+                    .frame(width: fillWidth, height: 28)
                     .animation(.linear(duration: Self.tickInterval), value: timeRemaining)
-            }
-            .overlay(
                 Text(String(format: "%.1fs", max(0, timeRemaining)))
                     .font(.system(size: 16, weight: .heavy, design: .rounded))
                     .foregroundColor(.white)
                     .shadow(color: .black.opacity(0.4), radius: 1)
-            )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 28)
+                Text(vehicleIcon)
+                    .font(.system(size: 66))
+                    // vehicleX tracks the current-time tip (sub-pixel per tick, so no
+                    // smoothing modifier needed); iconEntryOffset is the entry slide.
+                    .frame(width: vehicleSize, height: vehicleSize)
+                    // Swap the emoji instantly — only the slide (below) animates.
+                    .animation(nil, value: vehicleIcon)
+                    .offset(x: vehicleX + iconEntryOffset, y: -8)
+            }
+            .onAppear { timerBarWidth = geo.size.width }
+            .onChange(of: geo.size.width) { _ in timerBarWidth = geo.size.width }
+            .onChange(of: vehicleIcon) { _ in slideIconIn(vehicleSize: vehicleSize) }
         }
-        .frame(height: 28)
+        .frame(height: 78)
+    }
+
+    /// Snap the icon to the right end of the bar, then slide it to the current
+    /// remaining-time position — runs every time the vehicle icon upgrades.
+    private func slideIconIn(vehicleSize: CGFloat) {
+        guard timerBarWidth > vehicleSize else { return }
+        let fillWidth = max(0, timerBarWidth * timeFraction)
+        let vehicleX = min(max(fillWidth - vehicleSize / 2, 0), timerBarWidth - vehicleSize)
+        let rightEnd = timerBarWidth - vehicleSize
+
+        // Snap to the right end without animation.
+        var snap = Transaction()
+        snap.disablesAnimations = true
+        withTransaction(snap) { iconEntryOffset = rightEnd - vehicleX }
+
+        // Let that frame render, then slowly slide the icon left to catch up
+        // with the current remaining-time tip.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            withAnimation(.easeOut(duration: 1.6)) {
+                iconEntryOffset = 0
+            }
+        }
     }
 
     private var timerColor: Color {
@@ -1091,13 +1244,50 @@ struct ContentView: View {
 
     // MARK: - Question
 
+    private static let inkColor = Color(red: 0.2, green: 0.2, blue: 0.4)
+
     @ViewBuilder
     private var questionContent: some View {
-        if question.operation == .fractionOfWhole, let whole = question.whole {
+        if question.operation == .fractionAdd, let ops = question.fractionOperands, ops.count == 2 {
+            fractionAddView(ops[0], ops[1])
+        } else if question.operation == .fractionOfWhole, let whole = question.whole {
             fractionOfWholeView(numerator: question.left, denominator: question.right, whole: whole)
         } else {
             standardArithmeticView
         }
+    }
+
+    private func fractionView(_ f: Fraction, fontSize: CGFloat, color: Color) -> some View {
+        Group {
+            if f.den == 1 {
+                Text("\(f.num)")
+            } else {
+                VStack(spacing: 2) {
+                    Text("\(f.num)")
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(color)
+                        .frame(width: fontSize * 0.95, height: max(2, fontSize * 0.08))
+                    Text("\(f.den)")
+                }
+            }
+        }
+        .font(.system(size: fontSize, weight: .heavy, design: .rounded))
+        .monospacedDigit()
+        .foregroundColor(color)
+        .fixedSize()
+    }
+
+    private func fractionAddView(_ a: Fraction, _ b: Fraction) -> some View {
+        HStack(spacing: 16) {
+            fractionView(a, fontSize: 46, color: Self.inkColor)
+            Text("+")
+            fractionView(b, fontSize: 46, color: Self.inkColor)
+            Text("=")
+            Text("?")
+        }
+        .font(.system(size: 40, weight: .heavy, design: .rounded))
+        .monospacedDigit()
+        .foregroundColor(Self.inkColor)
     }
 
     private var standardArithmeticView: some View {
@@ -1214,18 +1404,25 @@ struct ContentView: View {
 
     private var choicesGrid: some View {
         LazyVGrid(columns: [GridItem(.flexible(), spacing: 16), GridItem(.flexible(), spacing: 16)], spacing: 16) {
-            ForEach(question.choices, id: \.self) { choice in
+            ForEach(Array(question.choices.enumerated()), id: \.element) { index, choice in
                 Button {
                     tap(choice)
                 } label: {
-                    Text("\(choice)")
-                        .font(.system(size: 44, weight: .bold, design: .rounded))
+                    Group {
+                        if question.operation == .fractionAdd,
+                           let opts = question.fractionOptions, choice < opts.count {
+                            fractionView(opts[choice], fontSize: 34, color: .white)
+                        } else {
+                            Text("\(choice)")
+                                .font(.system(size: 44, weight: .bold, design: .rounded))
+                        }
+                    }
                         .foregroundColor(.white)
                         .frame(maxWidth: .infinity)
                         .frame(height: 90)
                         .background(
                             RoundedRectangle(cornerRadius: 24)
-                                .fill(color(for: choice))
+                                .fill(color(for: choice, at: index))
                                 .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
                         )
                 }
@@ -1236,9 +1433,17 @@ struct ContentView: View {
         }
     }
 
-    private func color(for choice: Int) -> Color {
+    // A distinct shade per answer slot (used until an answer is chosen).
+    private static let choiceShades: [Color] = [
+        Color(red: 0.35, green: 0.55, blue: 0.95),   // blue
+        Color(red: 0.55, green: 0.40, blue: 0.90),   // purple
+        Color(red: 0.25, green: 0.72, blue: 0.62),   // teal
+        Color(red: 0.95, green: 0.55, blue: 0.30)    // orange
+    ]
+
+    private func color(for choice: Int, at index: Int) -> Color {
         guard let selected else {
-            return Color(red: 0.35, green: 0.55, blue: 0.95)
+            return Self.choiceShades[index % Self.choiceShades.count]
         }
         if choice == question.answer {
             return Color.green
@@ -1304,6 +1509,7 @@ struct ContentView: View {
             base = currentPoints
             withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
                 streak += 1
+                correctCount += 1
             }
             if streak >= 3 {
                 bonus = streak
@@ -1332,6 +1538,7 @@ struct ContentView: View {
         score = 0
         streak = 0
         bestStreak = 0
+        correctCount = 0
         selected = nil
         didTimeOut = false
         timeRemaining = Self.gameDuration
@@ -1340,6 +1547,10 @@ struct ContentView: View {
         bonusPopup = nil
         hasSubmittedScore = false
         showQuitConfirmation = false
+        newEntryID = nil
+        climbRemaining = 0
+        climbStarted = false
+        iconEntryOffset = 0
         question = Question.random(mode: newMode, age: age)
         phase = .playing
     }
@@ -1365,7 +1576,12 @@ struct ContentView: View {
             return
         }
         UserDefaults.standard.set(trimmed, forKey: Self.playerNameKey)
-        leaderboard.add(name: trimmed, score: score, mode: mode)
+        let newID = leaderboard.add(name: trimmed, score: score, mode: mode)
+        newEntryID = newID
+        climbStarted = false
+        let ranked = leaderboard.top(for: mode)
+        let idx = ranked.firstIndex { $0.id == newID } ?? 0
+        climbRemaining = max(0, ranked.count - 1 - idx)   // rows below = rows to climb
         hasSubmittedScore = true
         nameFieldFocused = false
         leaderboardMode = mode
@@ -1373,7 +1589,21 @@ struct ContentView: View {
     }
 
     private func leaveLeaderboard() {
+        newEntryID = nil
+        climbRemaining = 0
+        climbStarted = false
         phase = .welcome
+    }
+
+    /// Climb one row at a time, pausing 100 ms after each lower score is passed.
+    private func stepClimb() {
+        guard climbRemaining > 0 else { return }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            climbRemaining -= 1
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18 + 0.10) {
+            stepClimb()
+        }
     }
 
     private func playCorrectFeedback() {
